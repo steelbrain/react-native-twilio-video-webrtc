@@ -30,10 +30,36 @@ static NSString* cameraWasInterrupted         = @"cameraWasInterrupted";
 static NSString* cameraDidStopRunning         = @"cameraDidStopRunning";
 static NSString* statsReceived                = @"statsReceived";
 
-@interface RCTTWVideoModule () <TVIRemoteParticipantDelegate, TVIRoomDelegate, TVICameraCapturerDelegate>
+// 1024x768 squarish crop (1.25:1) on most iPhones. 1280x720 squarish crop (1.25:1) on the iPhone X and models that don't have 1024x768.
+static const CMVideoDimensions kRCTTWVideoAppCameraSourceDimensions = (CMVideoDimensions){900, 720};
 
-@property (strong, nonatomic) TVICameraCapturer *camera;
-@property (strong, nonatomic) TVIScreenCapturer *screen;
+static const int32_t kRCTTWVideoCameraSourceFrameRate = 15;
+
+TVIVideoFormat *RCTTWVideoModuleCameraSourceSelectVideoFormatBySize(AVCaptureDevice *device, CMVideoDimensions targetSize) {
+    TVIVideoFormat *selectedFormat = nil;
+    // Ordered from smallest to largest.
+    NSOrderedSet<TVIVideoFormat *> *formats = [TVICameraSource supportedFormatsForDevice:device];
+
+    for (TVIVideoFormat *format in formats) {
+        if (format.pixelFormat != TVIPixelFormatYUV420BiPlanarFullRange) {
+            continue;
+        }
+        selectedFormat = format;
+        CMVideoDimensions dimensions = format.dimensions;
+
+        if (dimensions.width >= targetSize.width && dimensions.height >= targetSize.height) {
+            // Break after finding the closest match
+            break;
+        }
+    }
+    return selectedFormat;
+}
+
+
+@interface RCTTWVideoModule () <TVIRemoteParticipantDelegate, TVIRoomDelegate, TVICameraSourceDelegate>
+
+@property (strong, nonatomic) TVICameraSource *camera;
+@property (strong, nonatomic) TVICameraSource *screen;
 @property (strong, nonatomic) TVILocalVideoTrack* localVideoTrack;
 @property (strong, nonatomic) TVILocalAudioTrack* localAudioTrack;
 @property (strong, nonatomic) TVIRoom *room;
@@ -75,10 +101,10 @@ RCT_EXPORT_MODULE();
 
 - (void)addLocalView:(TVIVideoView *)view {
   [self.localVideoTrack addRenderer:view];
-  if (self.camera && self.camera.source == TVICameraCaptureSourceBackCameraWide) {
-    view.mirror = NO;
-  } else {
+  if (self.camera && self.camera.device.position == AVCaptureDevicePositionFront) {
     view.mirror = YES;
+  } else {
+    view.mirror = NO;
   }
 }
 
@@ -102,6 +128,43 @@ RCT_EXPORT_MODULE();
   }
 }
 
+- (void)startCameraSourceWithPosition:(AVCaptureDevicePosition)position camera: (TVICameraSource *)cameraSource {
+    AVCaptureDevice *camera = [TVICameraSource captureDeviceForPosition:position];
+    CMVideoDimensions dimensions;
+    CGFloat cropRatio;
+    int32_t frameRate;
+    cropRatio = (CGFloat)kRCTTWVideoAppCameraSourceDimensions.width / (CGFloat)kRCTTWVideoAppCameraSourceDimensions.height;
+    dimensions = kRCTTWVideoAppCameraSourceDimensions;
+    frameRate = kRCTTWVideoCameraSourceFrameRate;
+    TVIVideoFormat *preferredFormat = RCTTWVideoModuleCameraSourceSelectVideoFormatBySize(camera, dimensions);
+    preferredFormat.frameRate = MIN(preferredFormat.frameRate, frameRate);
+
+    CMVideoDimensions cropDimensions = preferredFormat.dimensions;
+    if (cropDimensions.width > cropDimensions.height) {
+        cropDimensions.width = cropDimensions.height * cropRatio;
+    } else {
+        cropDimensions.height = cropDimensions.width * cropRatio;
+    }
+
+    TVIVideoFormat *outputFormat = [[TVIVideoFormat alloc] init];
+    outputFormat.dimensions = cropDimensions;
+    outputFormat.pixelFormat = preferredFormat.pixelFormat;
+    outputFormat.frameRate = 0;
+
+    NSLog(@"Cropping camera output to format: %@", outputFormat);
+
+    [cameraSource requestOutputFormat:outputFormat];
+
+    [cameraSource startCaptureWithDevice:camera format:preferredFormat completion:^(AVCaptureDevice *device,
+            TVIVideoFormat *startFormat,
+            NSError *error) {
+        if (!error) {
+            // TODO: Video capture started here
+            // TODO: Set mirror properly
+        }
+    }];
+}
+
 RCT_EXPORT_METHOD(changeListenerStatus:(BOOL)value) {
     self.listening = value;
 }
@@ -117,17 +180,23 @@ RCT_EXPORT_METHOD(setRemoteAudioPlayback:(NSString *)participantSid enabled:(BOO
 }
 
 RCT_EXPORT_METHOD(startLocalVideo:(BOOL)screenShare) {
-  if (screenShare) {
-    UIViewController *rootViewController = [UIApplication sharedApplication].delegate.window.rootViewController;
-    self.screen = [[TVIScreenCapturer alloc] initWithView:rootViewController.view];
+    if (screenShare) {
+        // TODO
+    } else  {
+        TVICameraSourceOptions *options = [TVICameraSourceOptions optionsWithBlock:^(TVICameraSourceOptionsBuilder * _Nonnull builder) {
+            if (@available(iOS 13, *)) {
+                UIWindowScene *keyScene = [UIApplication sharedApplication].keyWindow.windowScene;
+                builder.orientationTracker = [TVIUserInterfaceTracker trackerWithScene:keyScene];
+            }
+        }];
 
-    self.localVideoTrack = [TVILocalVideoTrack trackWithCapturer:self.screen enabled:YES constraints:[self videoConstraints] name:@"screen"];
-  } else if ([TVICameraCapturer availableSources].count > 0) {
-    self.camera = [[TVICameraCapturer alloc] init];
-    self.camera.delegate = self;
-
-    self.localVideoTrack = [TVILocalVideoTrack trackWithCapturer:self.camera enabled:YES constraints:[self videoConstraints] name:@"camera"];
-  }
+        self.camera = [[TVICameraSource alloc] initWithOptions:options delegate:self];
+        if (self.camera == nil) {
+            return;
+        }
+        self.localVideoTrack = [TVILocalVideoTrack trackWithSource:self.camera enabled:YES name:@"camera"];
+        [self startCameraSourceWithPosition:AVCaptureDevicePositionFront camera:self.camera];
+    }
 }
 
 RCT_EXPORT_METHOD(startLocalAudio) {
@@ -159,26 +228,17 @@ RCT_REMAP_METHOD(setLocalVideoEnabled, enabled:(BOOL)enabled setLocalVideoEnable
 
 
 RCT_EXPORT_METHOD(flipCamera) {
-  if (self.camera.source == TVICameraCaptureSourceFrontCamera) {
-    [self.camera selectSource:TVICameraCaptureSourceBackCameraWide];
-    if (self.localVideoTrack) {
-      for (TVIVideoView *r in self.localVideoTrack.renderers) {
-        r.mirror = NO;
-      }
-    }
-  } else {
-    [self.camera selectSource:TVICameraCaptureSourceFrontCamera];
-    if (self.localVideoTrack) {
-      for (TVIVideoView *r in self.localVideoTrack.renderers) {
-        r.mirror = YES;
-      }
-    }
+    if (self.camera) {
+        AVCaptureDevicePosition position = self.camera.device.position;
+        AVCaptureDevicePosition nextPosition = position == AVCaptureDevicePositionFront ? AVCaptureDevicePositionBack : AVCaptureDevicePositionFront;
+
+        [self startCameraSourceWithPosition:nextPosition camera:self.camera];
   }
 }
 
 RCT_EXPORT_METHOD(toggleSoundSetup:(BOOL)speaker) {
   if(speaker){
-      kDefaultAVAudioSessionConfigurationBlock();
+      // kDefaultAVAudioSessionConfigurationBlock();
 
       // Overwrite the audio route
       AVAudioSession *session = [AVAudioSession sharedInstance];
@@ -191,7 +251,7 @@ RCT_EXPORT_METHOD(toggleSoundSetup:(BOOL)speaker) {
           NSLog(@"AVAudiosession overrideOutputAudioPort %@",error);
       }
     } else {
-      kDefaultAVAudioSessionConfigurationBlock();
+      // kDefaultAVAudioSessionConfigurationBlock();
 
       // Overwrite the audio route
       AVAudioSession *session = [AVAudioSession sharedInstance];
@@ -314,21 +374,11 @@ RCT_EXPORT_METHOD(connect:(NSString *)accessToken roomName:(NSString *)roomName)
     builder.roomName = roomName;
   }];
 
-  self.room = [TwilioVideo connectWithOptions:connectOptions delegate:self];
+  self.room = [TwilioVideoSDK connectWithOptions:connectOptions delegate:self];
 }
 
 RCT_EXPORT_METHOD(disconnect) {
   [self.room disconnect];
-}
-
--(TVIVideoConstraints*) videoConstraints {
-  return [TVIVideoConstraints constraintsWithBlock:^(TVIVideoConstraintsBuilder *builder) {
-    builder.minSize = TVIVideoConstraintsSize960x540;
-    builder.maxSize = TVIVideoConstraintsSize1280x720;
-    builder.aspectRatio = TVIAspectRatio16x9;
-    builder.minFrameRate = TVIVideoConstraintsFrameRateNone;
-    builder.maxFrameRate = TVIVideoConstraintsFrameRateNone;
-  }];
 }
 
 # pragma mark - TVICameraCapturerDelegate
@@ -339,15 +389,15 @@ RCT_EXPORT_METHOD(disconnect) {
     }
 }
 
--(void)cameraCapturerWasInterrupted:(TVICameraCapturer *)capturer {
+-(void)cameraCapturerWasInterrupted:(TVICameraSource *)capturer {
     [self sendEventCheckingListenerWithName:cameraWasInterrupted body:nil];
 }
 
--(void)cameraCapturerPreviewDidStart:(TVICameraCapturer *)capturer {
+-(void)cameraCapturerPreviewDidStart:(TVICameraSource *)capturer {
   [self sendEventCheckingListenerWithName:cameraDidStart body:nil];
 }
 
--(void)cameraCapturer:(TVICameraCapturer *)capturer didStopRunningWithError:(NSError *)error {
+-(void)cameraCapturer:(TVICameraSource *)capturer didStopRunningWithError:(NSError *)error {
   [self sendEventCheckingListenerWithName:cameraDidStopRunning body:@{ @"error" : error.localizedDescription }];
 }
 
@@ -363,7 +413,7 @@ RCT_EXPORT_METHOD(disconnect) {
   TVILocalParticipant *localParticipant = room.localParticipant;
   [participants addObject:[localParticipant toJSON]];
     [self sendEventCheckingListenerWithName:roomDidConnect body:@{ @"roomName" : room.name , @"roomSid": room.sid, @"participants" : participants }];
-   
+
 }
 
 - (void)room:(TVIRoom *)room didDisconnectWithError:(nullable NSError *)error {
