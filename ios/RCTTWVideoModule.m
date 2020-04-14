@@ -124,44 +124,6 @@ RCT_EXPORT_MODULE();
   }
 }
 
-- (void)startCameraSourceWithPosition:(AVCaptureDevicePosition)position {
-    AVCaptureDevice *camera = [TVICameraSource captureDeviceForPosition:position];
-    CMVideoDimensions dimensions;
-    CGFloat cropRatio;
-    int32_t frameRate;
-    cropRatio = (CGFloat)kRCTTWVideoAppCameraSourceDimensions.width / (CGFloat)kRCTTWVideoAppCameraSourceDimensions.height;
-    dimensions = kRCTTWVideoAppCameraSourceDimensions;
-    frameRate = kRCTTWVideoCameraSourceFrameRate;
-    TVIVideoFormat *preferredFormat = RCTTWVideoModuleCameraSourceSelectVideoFormatBySize(camera, dimensions);
-    preferredFormat.frameRate = MIN(preferredFormat.frameRate, frameRate);
-
-    CMVideoDimensions cropDimensions = preferredFormat.dimensions;
-    if (cropDimensions.width > cropDimensions.height) {
-        cropDimensions.width = cropDimensions.height * cropRatio;
-    } else {
-        cropDimensions.height = cropDimensions.width * cropRatio;
-    }
-
-    TVIVideoFormat *outputFormat = [[TVIVideoFormat alloc] init];
-    outputFormat.dimensions = cropDimensions;
-    outputFormat.pixelFormat = preferredFormat.pixelFormat;
-    outputFormat.frameRate = 0;
-
-    NSLog(@"Cropping camera output to format: %@", outputFormat);
-
-    [self.camera requestOutputFormat:outputFormat];
-
-    [self.camera startCaptureWithDevice:camera format:preferredFormat completion:^(AVCaptureDevice *device,
-            TVIVideoFormat *startFormat,
-            NSError *error) {
-        if (!error) {
-            [self sendEventCheckingListenerWithName:cameraDidStart body:nil];
-            // TODO: Video capture started here
-            // TODO: Set mirror properly
-        }
-    }];
-}
-
 RCT_EXPORT_METHOD(changeListenerStatus:(BOOL)value) {
     self.listening = value;
 }
@@ -185,7 +147,17 @@ RCT_EXPORT_METHOD(startLocalVideo) {
       return;
   }
   self.localVideoTrack = [TVILocalVideoTrack trackWithSource:self.camera enabled:YES name:@"camera"];
-  [self startCameraSourceWithPosition:AVCaptureDevicePositionFront];
+  AVCaptureDevice *camera = [TVICameraSource captureDeviceForPosition:position];
+  [self.camera startCaptureWithDevice:camera completion:^(AVCaptureDevice *device,
+          TVIVideoFormat *startFormat,
+          NSError *error) {
+      if (!error) {
+          [self sendEventCheckingListenerWithName:cameraDidStart body:nil];
+          for (TVIVideoView *renderer in self.localVideoTrack.renderers) {
+              renderer.mirror = true;
+          }
+      }
+  }];
 }
 
 RCT_EXPORT_METHOD(startLocalAudio) {
@@ -220,8 +192,18 @@ RCT_EXPORT_METHOD(flipCamera) {
     if (self.camera) {
         AVCaptureDevicePosition position = self.camera.device.position;
         AVCaptureDevicePosition nextPosition = position == AVCaptureDevicePositionFront ? AVCaptureDevicePositionBack : AVCaptureDevicePositionFront;
+        BOOL mirror = nextPosition == AVCaptureDevicePositionFront;
 
-        [self startCameraSourceWithPosition:nextPosition];
+        AVCaptureDevice *captureDevice = [TVICameraSource captureDeviceForPosition:nextPosition];
+        [self.camera selectCaptureDevice:captureDevice completion:^(AVCaptureDevice *device,
+                TVIVideoFormat *startFormat,
+                NSError *error) {
+            if (!error) {
+                for (TVIVideoView *renderer in self.localVideoTrack.renderers) {
+                    renderer.mirror = mirror;
+                }
+            }
+        }];
   }
 }
 
@@ -372,7 +354,7 @@ RCT_EXPORT_METHOD(disconnect) {
 
 # pragma mark - Common
 
--(void)sendEventCheckingListenerWithName:(NSString *)event body:(NSMutableDictionary *)body {
+-(void)sendEventCheckingListenerWithName:(NSString *)event body:(NSDictionary *)body {
     if (_listening) {
         [self sendEventWithName:event body:body];
     }
@@ -381,7 +363,7 @@ RCT_EXPORT_METHOD(disconnect) {
 # pragma mark - TVICameraSourceDelegate
 
 
-- (void)cameraSourceWasInterrupted:(nonnull TVICameraSource *)source reason:(AVCaptureSessionInterruptionReason)reason {
+- (void)cameraSourceWasInterrupted:(nonnull TVICameraSource *)source reason:(AVCaptureSessionInterruptionReason)reason  API_AVAILABLE(ios(9.0)){
     NSString *reasonStr = @"unknown";
     if (@available(iOS 9.0, *)) {
         if (reason == AVCaptureSessionInterruptionReasonVideoDeviceNotAvailableInBackground) {
